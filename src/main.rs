@@ -62,7 +62,35 @@ struct AttackEvent {
     event_type: String,
     ip: String,
     country: String,
+    lat: f64,
+    lon: f64,
     timestamp: String,
+}
+
+#[derive(Serialize)]
+struct GeoInfo {
+    country: String,
+    lat: f64,
+    lon: f64,
+}
+
+fn lookup_geo(ip: &str, reader: &Reader<Vec<u8>>) -> Option<GeoInfo> {
+    let ip_addr: IpAddr = ip.parse().ok()?;
+    let city: geoip2::City = reader.lookup(ip_addr).ok()?;
+
+    let country = city
+        .country?
+        .names?
+        .get("en")?
+        .to_string();
+
+    let location = city.location?;
+
+    Some(GeoInfo {
+        country,
+        lat: location.latitude?,
+        lon: location.longitude?,
+    })
 }
 
 fn lookup_country(ip: &str, reader: &Reader<Vec<u8>>) -> Option<String> {
@@ -79,7 +107,7 @@ fn lookup_country(ip: &str, reader: &Reader<Vec<u8>>) -> Option<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let geo_reader = Arc::new(
-        Reader::open_readfile("GeoLite2-Country.mmdb")?
+        Reader::open_readfile("GeoLite2-City.mmdb")?
     );
 
     // DB接続
@@ -174,18 +202,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let ip_only = addr.to_string().split(':').next().unwrap().to_string();
 
-                let country_name = lookup_country(&ip_only, &geo_reader)
-                    .unwrap_or("Unknown".to_string());
+                if let Some(geo) = lookup_geo(&ip_only, &geo_reader) {
+                    let event = AttackEvent {
+                        event_type: "attack".to_string(),
+                        ip: addr.to_string(),
+                        country: geo.country,
+                        lat: geo.lat,
+                        lon: geo.lon,
+                        timestamp: timestamp.clone(),
+                    };
 
-                let event = AttackEvent {
-                    event_type: "attack".to_string(),
-                    ip: addr.to_string(),
-                    country: country_name,
-                    timestamp: timestamp.clone(),
-                };
-
-                if let Ok(json) = serde_json::to_string(&event) {
-                    let _ = tx.send(json);
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        let _ = tx.send(json);
+                    }
                 }
 
                 let _ = socket.write_all(b"Permission denied\r\nlogin: ").await;

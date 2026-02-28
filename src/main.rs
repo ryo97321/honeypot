@@ -15,6 +15,7 @@ use axum::response::IntoResponse;
 use axum::http::HeaderMap;
 use tower_http::services::ServeDir;
 use tokio::time::{interval, Duration};
+use std::sync::Arc;
 
 #[derive(Serialize)]
 struct Log {
@@ -53,6 +54,7 @@ struct CountryStat {
 struct AppState {
     pool: SqlitePool,
     tx: broadcast::Sender<String>,
+    geo_reader: std::sync::Arc<Reader<Vec<u8>>>,
 }
 
 #[derive(Serialize)]
@@ -64,26 +66,21 @@ struct AttackEvent {
 }
 
 fn lookup_country(ip: &str, reader: &Reader<Vec<u8>>) -> Option<String> {
-    if ip.starts_with("127.") || ip.starts_with("192.") {
-        return Some("JP".to_string()); // 開発用
-    }
-
     let ip_addr: IpAddr = ip.parse().ok()?;
     let country: geoip2::Country = reader.lookup(ip_addr).ok()?;
-    country.country?.iso_code.map(|c| c.to_string())
-}
-
-fn iso2_to_name(code: &str) -> String {
-    match code {
-        "JP" => "Japan".to_string(),
-        "US" => "United States of America".to_string(),
-        "CN" => "China".to_string(),
-        _ => code.to_string(),
-    }
+    country
+        .country?
+        .names?
+        .get("en")
+        .map(|name| name.to_string())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    let geo_reader = Arc::new(
+        Reader::open_readfile("GeoLite2-Country.mmdb")?
+    );
 
     // DB接続
     let pool = SqlitePoolOptions::new()
@@ -108,7 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         pool: pool.clone(),
         tx: tx.clone(),
+        geo_reader: geo_reader.clone(),
     };
+
+    let app_state = state.clone();
+    let honeypot_state = state.clone();
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -125,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ws", get(ws_handler))
         .nest_service("/", ServeDir::new("/home/honeypot/dist"))
         .layer(cors)
-        .with_state(state);
+        .with_state(app_state);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
     let web_server = axum::serve(listener, app);
@@ -137,8 +138,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         loop {
             let (mut socket, addr) = listener.accept().await?;
-            let pool = pool.clone();
-            let tx = tx.clone();
+            let pool = honeypot_state.pool.clone();
+            let tx = honeypot_state.tx.clone();
+            let geo_reader = honeypot_state.geo_reader.clone();
 
             tokio::spawn(async move {
                 let mut buffer = [0; 1024];
@@ -170,10 +172,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .execute(&pool)
                     .await;
 
+                let ip_only = addr.to_string().split(':').next().unwrap().to_string();
+
+                let country_name = lookup_country(&ip_only, &geo_reader)
+                    .unwrap_or("Unknown".to_string());
+
                 let event = AttackEvent {
                     event_type: "attack".to_string(),
                     ip: addr.to_string(),
-                    country: iso2_to_name("JP"), // 仮
+                    country: country_name,
                     timestamp: timestamp.clone(),
                 };
 
@@ -323,7 +330,7 @@ async fn get_country_stats(
     .await
     .unwrap();
 
-    let reader = Reader::open_readfile("GeoLite2-Country.mmdb").unwrap();
+    let reader = &state.geo_reader;
 
     let mut map = std::collections::HashMap::new();
 
@@ -331,8 +338,7 @@ async fn get_country_stats(
         let ip: String = row.get("ip");
         let count: i64 = row.get("count");
 
-        if let Some(country) = lookup_country(&ip.split(':').next().unwrap(), &reader) {
-            let country_name = iso2_to_name(&country);
+        if let Some(country_name) = lookup_country(ip.split(':').next().unwrap(), reader) {
             *map.entry(country_name).or_insert(0) += count;
         }
     }

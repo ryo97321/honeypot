@@ -74,6 +74,26 @@ struct GeoInfo {
     lon: f64,
 }
 
+#[derive(Serialize)]
+struct CredentialEvent {
+    event_type: String,
+    ip: String,
+    username: String,
+    password: String,
+    timestamp: String,
+}
+
+enum SessionState {
+    Username,
+    Password,
+}
+
+#[derive(Serialize)]
+struct PasswordRanking {
+    password: String,
+    count: i64,
+}
+
 fn lookup_geo(ip: &str, reader: &Reader<Vec<u8>>) -> Option<GeoInfo> {
     let ip_addr: IpAddr = ip.parse().ok()?;
     let city: geoip2::City = reader.lookup(ip_addr).ok()?;
@@ -129,6 +149,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS credentials (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ip TEXT,
+          username TEXT,
+          password TEXT,
+          timestamp TEXT
+        )
+        "#
+    )
+    .execute(&pool)
+    .await?;
+
     let (tx, _) = broadcast::channel(100);
     let state = AppState {
         pool: pool.clone(),
@@ -151,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/stats/hourly", get(get_hourly_stats))
         .route("/stats/bruteforce", get(get_bruteforce_stats))
         .route("/stats/countries", get(get_country_stats))
+        .route("/stats/passwords", get(get_password_ranking))
         .route("/ws", get(ws_handler))
         .nest_service("/", ServeDir::new("/home/honeypot/dist"))
         .layer(cors)
@@ -173,6 +208,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 let mut buffer = [0; 1024];
 
+                let mut state = SessionState::Username;
+                let mut username = String::new();
+
                 let _ = socket.write_all(b"SSH-2.0-OpenSSH_8.2p1\r\nlogin: ").await;
 
                 loop {
@@ -194,31 +232,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .execute(&pool)
                     .await;
 
+                match state {
+                    SessionState::Username => {
+                        username = input;
+                        state = SessionState::Password;
+
+                        let _ = socket.write_all(b"password: ").await;
+                    }
+
+                    SessionState::Password => {
+                        let password = input;
+
+                        // credential保存
+                        let _ = sqlx::query(
+                            "INSERT INTO credentials (ip, username, password, timestamp) VALUES (?, ?, ?, ?)"
+                        )
+                            .bind(addr.to_string())
+                            .bind(&username)
+                            .bind(&password)
+                            .bind(&timestamp)
+                            .execute(&pool)
+                            .await;
+
+                        // Geo取得
+                        let ip_only = addr.to_string().split(':').next().unwrap().to_string();
+                        if let Some(geo) = lookup_geo(&ip_only, &geo_reader) {
+                            let event = AttackEvent {
+                                event_type:  "attack".to_string(),
+                                ip: addr.to_string(),
+                                country: geo.country,
+                                lat: geo.lat,
+                                lon: geo.lon,
+                                timestamp: timestamp.clone(),
+                            };
+
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = tx.send(json);
+                            }
+                        }
+
+                        // Credentialイベント送信
+                        let cred_event = CredentialEvent {
+                            event_type: "credential".to_string(),
+                            ip: addr.to_string(),
+                            username: username.clone(),
+                            password: password.clone(),
+                            timestamp: timestamp.clone(),
+                        };
+
+                        if let Ok(json) = serde_json::to_string(&cred_event) {
+                            let _ = tx.send(json);
+                        }
+
+                        // リセット
+                        state = SessionState::Username;
+                        let _ = socket.write_all(b"Permission denied\r\nlogin: ").await;
+                    }
+                }
+                }
+
                 let _ = sqlx::query(
                     "DELETE FROM attack_logs WHERE id < (SELECT MAX(id) - 100000 FROM attack_logs)"
                 )
                     .execute(&pool)
                     .await;
 
-                let ip_only = addr.to_string().split(':').next().unwrap().to_string();
-
-                if let Some(geo) = lookup_geo(&ip_only, &geo_reader) {
-                    let event = AttackEvent {
-                        event_type: "attack".to_string(),
-                        ip: addr.to_string(),
-                        country: geo.country,
-                        lat: geo.lat,
-                        lon: geo.lon,
-                        timestamp: timestamp.clone(),
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = tx.send(json);
-                    }
-                }
-
-                let _ = socket.write_all(b"Permission denied\r\nlogin: ").await;
-                }
             });
         }
         #[allow(unreachable_code)]
@@ -429,5 +507,29 @@ async fn handle_socket(
             }
         }
     }
+}
+
+async fn get_password_ranking(
+    State(state): State<AppState>,
+) -> Json<Vec<PasswordRanking>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT password, COUNT(*) as count
+        FROM credentials
+        GROUP BY password
+        ORDER BY count DESC
+        LIMIT 20
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+
+    let result = rows.into_iter().map(|row| PasswordRanking {
+        password: row.get("password"),
+        count: row.get("count"),
+    }).collect();
+
+    Json(result)
 }
 
